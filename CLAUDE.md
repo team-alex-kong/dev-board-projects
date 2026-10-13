@@ -1,0 +1,1 @@
+- Instructions are in ./AGENTS.md, pls read that. AGENTS.md's content should be considered part of CLAUDE.md, but agent-agnostic. This file is for redirection only, do NOT edit

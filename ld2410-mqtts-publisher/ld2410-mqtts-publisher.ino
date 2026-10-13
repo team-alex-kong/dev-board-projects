@@ -18,9 +18,12 @@ MyLD2410 sensor(sensorSerial, true);
 MyLD2410 sensor(sensorSerial);
 #endif
 
-unsigned long next_positive_publish_at = 0;
-unsigned long next_negative_publish_at = 0;
-bool is_prev_positive = true;
+uint32_t last_publish_at = 0;
+bool has_published = false;
+bool is_prev_positive = false;
+bool sensor_ready = false;
+uint32_t last_sensor_attempt_at = 0;
+uint32_t last_sensor_data_at = 0;
 
 void printValue(const byte &val) {
   Serial.print(' ');
@@ -78,58 +81,54 @@ void printData() {
 
 WiFiClientSecure wifi_client;
 PubSubClient mqtts_client(wifi_client);
+uint32_t last_wifi_attempt_at = 0;
+uint32_t last_mqtt_attempt_at = 0;
+bool mqtt_attempted = false;
 
-void setup_wifi(int attempts = 0) {
-  const auto max_attempts = 10;
-  if (attempts >= max_attempts) {
-    Serial.printf("\nmax_attempts (%d) reached, restarting the device as the "
-                  "last resort\n",
-                  max_attempts);
-#if defined(ARDUINO_ARCH_ESP32)
-    ESP.restart();
-#elif defined(ARDUINO_ARCH_RP2040)
-    rp2040.reboot();
-#endif
-  }
+void setup_wifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  Serial.printf("\nConnecting to WiFi [" WIFI_SSID "] (%d/%d)\n", attempts + 1,
-                max_attempts);
-
-  for (int i = 0; i < 60; ++i) {
-    delay(1000);
-    Serial.print(".");
-    if (WiFi.status() != WL_CONNECTED)
-      continue;
-
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
-    return;
-  }
-  setup_wifi(attempts + 1);
+  last_wifi_attempt_at = millis();
+  Serial.println("Connecting to WiFi [" WIFI_SSID "]");
 }
 
 void reconnect_mqtts() {
-  while (!mqtts_client.connected()) {
-
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi lost. Reconnecting...");
+  const auto t_ms = millis();
+  if (WiFi.status() != WL_CONNECTED) {
+    mqtt_attempted = false;
+    if (mqtts_client.connected())
+      mqtts_client.disconnect();
+    if (uint32_t(t_ms - last_wifi_attempt_at) >= 60000UL)
       setup_wifi();
-    }
+    return;
+  }
+  if (mqtts_client.connected() ||
+      (mqtt_attempted && uint32_t(t_ms - last_mqtt_attempt_at) < 10000UL))
+    return;
 
-    Serial.printf("Connecting to MQTT broker " MQTT_SERVER
-                  ":%d with MQTT_CLIENT_ID: " MQTT_CLIENT_ID "\n",
-                  MQTT_PORT);
-    if (mqtts_client.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
-      Serial.println("connected");
-    } else {
-      const int retry_delay_ms = 10 * 1000;
-      Serial.print("mqtts_client.connect() failed, mqtts_client.state() = ");
-      Serial.print(mqtts_client.state());
-      Serial.printf(" retrying in %d seconds\n", retry_delay_ms / 1000);
-      delay(retry_delay_ms);
-    }
+  mqtt_attempted = true;
+  Serial.printf("Connecting to MQTT broker " MQTT_SERVER
+                ":%d with MQTT_CLIENT_ID: " MQTT_CLIENT_ID "\n",
+                MQTT_PORT);
+  if (mqtts_client.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD)) {
+    has_published = false;
+    Serial.println("connected");
+  } else {
+    Serial.printf("mqtts_client.connect() failed, state = %d; retrying in 10 seconds\n",
+                  mqtts_client.state());
+  }
+  last_mqtt_attempt_at = millis();
+}
+
+void setup_sensor() {
+  sensor_ready = sensor.begin() && sensor.enhancedMode();
+  last_sensor_attempt_at = millis();
+  if (sensor_ready) {
+    last_sensor_data_at = last_sensor_attempt_at;
+    has_published = false;
+    Serial.println("Sensor connected");
+  } else {
+    Serial.println("Failed to communicate with the sensor; retrying in 5 seconds");
   }
 }
 
@@ -148,15 +147,8 @@ void setup() {
 
   delay(2000);
   Serial.println(__FILE__);
-  if (!sensor.begin()) {
-    Serial.println("Failed to communicate with the sensor.");
-    while (true) {
-    }
-  }
-  //  enhanced (engineering) modes.
-  sensor.enhancedMode();
+  setup_sensor();
 
-  //  delay(next_positive_publish_at);
   setup_wifi();
 #if defined(MQTT_SSL_SET_INSECURE)
   Serial.println(
@@ -167,31 +159,47 @@ void setup() {
   wifi_client.setCACert(root_ca);
 #endif
   mqtts_client.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtts_client.setSocketTimeout(2);
 }
 
 void loop() {
-  if (sensor.check() != MyLD2410::Response::DATA)
-    return;
-  const auto t_ms = millis();
+  mqtts_client.loop();
+  reconnect_mqtts();
 
-  // if (millis < next_positive_publish_at && millis < next_negative_publish_at)
-  //   return;
+  if (!sensor_ready) {
+    if (uint32_t(millis() - last_sensor_attempt_at) >= 5000UL)
+      setup_sensor();
+    return;
+  }
+
+  bool has_sensor_data = false;
+  while (sensorSerial.available()) {
+    if (sensor.check() == MyLD2410::Response::DATA)
+      has_sensor_data = true;
+  }
+  const auto t_ms = millis();
+  if (!has_sensor_data) {
+    if (uint32_t(t_ms - last_sensor_data_at) >= 5000UL) {
+      sensor_ready = false;
+      Serial.println("Sensor data timed out; reconnecting");
+    }
+    return;
+  }
+  last_sensor_data_at = t_ms;
+  if (!mqtts_client.connected())
+    return;
 
   const auto moving_target_detected = sensor.movingTargetDetected();
   const auto stationary_target_detected = sensor.stationaryTargetDetected();
 
   const auto is_curr_positive =
       moving_target_detected || stationary_target_detected;
-  if (!is_prev_positive && !is_curr_positive && t_ms < next_negative_publish_at)
+  const uint32_t publish_interval_ms = is_curr_positive
+                                          ? MQTT_POSITIVE_PUBLISH_INTERVAL_MS
+                                          : MQTT_NEGATIVE_PUBLISH_INTERVAL_MS;
+  if (has_published && is_prev_positive == is_curr_positive &&
+      uint32_t(t_ms - last_publish_at) < publish_interval_ms)
     return;
-  if ((is_prev_positive || is_curr_positive) && t_ms < next_positive_publish_at)
-    return;
-  is_prev_positive = is_curr_positive;
-
-  if (is_curr_positive)
-    next_positive_publish_at = t_ms + MQTT_POSITIVE_PUBLISH_INTERVAL_MS;
-  else
-    next_negative_publish_at = t_ms + MQTT_NEGATIVE_PUBLISH_INTERVAL_MS;
 
   JsonDocument jsonDoc;
   jsonDoc["stationary_target_detected"] = stationary_target_detected;
@@ -210,12 +218,12 @@ void loop() {
   std::string msgPackStr;
   size_t size = serializeMsgPack(jsonDoc, msgPackStr);
 
-  mqtts_client.loop();
-  if (!mqtts_client.connected()) {
-    reconnect_mqtts();
-  }
-
-  if (mqtts_client.publish(MQTT_TOPIC, msgPackStr.c_str())) {
+  if (mqtts_client.publish(
+          MQTT_TOPIC, reinterpret_cast<const uint8_t *>(msgPackStr.data()),
+          size)) {
+    last_publish_at = millis();
+    has_published = true;
+    is_prev_positive = is_curr_positive;
     Serial.println("done");
   } else {
     Serial.println("failed!");
